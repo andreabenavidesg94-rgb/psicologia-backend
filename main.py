@@ -1,6 +1,5 @@
 import json
 import os
-from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -18,8 +17,7 @@ from firebase_admin import auth, credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-from pathlib import Path
-load_dotenv(Path(__file__).with_name(".env"))
+load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -254,13 +252,42 @@ def google_verify_subscription(package_name: str, purchase_token: str) -> dict[s
     )
 
 
-def upsert_entitlement(db, firebase_uid: str, email: Optional[str], user_id: str, purchase_token: str, product_id: str, payload: dict[str, Any]) -> SubscriptionEntitlement:
+def upsert_entitlement(
+    db,
+    firebase_uid: str,
+    email: Optional[str],
+    user_id: str,
+    purchase_token: str,
+    product_id: str,
+    payload: dict[str, Any],
+) -> SubscriptionEntitlement:
+    """
+    Vincula un purchase_token a UN SOLO usuario Firebase.
+
+    Google Play restaura compras según la cuenta Google del dispositivo,
+    no según el login interno de Firebase. Si el mismo token ya fue vinculado
+    a otro firebase_uid, NO debe reasignarse automáticamente a la cuenta actual.
+    Esto evita que una suscripción comprada por una cuenta se arrastre a otra.
+    """
     plan = map_plan_from_product_id(product_id)
     status, is_active = map_status_from_google_payload(payload)
     expiry_date = extract_expiry_date(payload)
     latest_order_id = extract_order_id(payload)
 
-    existing = db.query(SubscriptionEntitlement).filter(SubscriptionEntitlement.purchase_token == purchase_token).first()
+    existing = (
+        db.query(SubscriptionEntitlement)
+        .filter(SubscriptionEntitlement.purchase_token == purchase_token)
+        .first()
+    )
+
+    if existing is not None and existing.firebase_uid != firebase_uid:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "purchase_token_already_bound",
+                "message": "Esta compra ya está vinculada a otra cuenta de PsicologIA.",
+            },
+        )
 
     if existing is None:
         existing = SubscriptionEntitlement(
@@ -280,7 +307,6 @@ def upsert_entitlement(db, firebase_uid: str, email: Optional[str], user_id: str
         db.add(existing)
     else:
         existing.user_id = user_id
-        existing.firebase_uid = firebase_uid
         existing.email = email
         existing.product_id = product_id
         existing.plan = plan
@@ -638,6 +664,8 @@ def restore_subscription(req: RestoreSubscriptionRequest, authorization: Optiona
                     payload=payload,
                 )
                 restored_rows.append(row)
+            except HTTPException as e:
+                errors.append({"purchase_token": token, "error": e.detail})
             except Exception as e:
                 errors.append({"purchase_token": token, "error": str(e)})
 
