@@ -1,6 +1,9 @@
 fastapi
-uvicorn
-sqlalchemy
-pydantic
+uvicorn[standard]
 python-dotenv
+sqlalchemy
 openai
+firebase-admin
+google-api-python-client
+google-auth
+psycopg2-binary
