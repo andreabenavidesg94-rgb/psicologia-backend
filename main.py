@@ -160,7 +160,8 @@ class ChatRequest(BaseModel):
     mensaje: str
     user_name: str | None = "Tú"
     assistant_name: str | None = "Andrea"
-    focus_area: str | None = "Ansiedad"
+    focus_area: str | None = "general"
+    companion_style: str | None = "suave"   # suave | directa | motivadora | reflexiva
     remembered_topic: str | None = ""
     user_id: str | None = None
 
@@ -378,55 +379,141 @@ def heuristic_memory_update(message: str) -> Optional[str]:
 
 def fallback_chat_reply(req: ChatRequest) -> str:
     texto = req.mensaje.lower()
+    nombre = (req.user_name or "").strip() or "Tú"
 
-    if "ansiedad" in texto or "nervios" in texto:
-        return f"{req.user_name}, gracias por contármelo. Vamos a bajar un poco el ritmo. ¿Qué fue lo que más activó esa ansiedad hoy?"
-    if "relación" in texto or "pareja" in texto or "amor" in texto:
-        return "Entiendo. Cuando una relación pesa, todo se siente más intenso. ¿Qué fue lo que más te dolió exactamente?"
-    if "agot" in texto or "cans" in texto:
-        return "Suena a que vienes sosteniendo demasiado. ¿Sientes más cansancio físico, mental o emocional?"
-    if "sola" in texto or "solo" in texto:
-        return "Estoy aquí contigo. No tienes que cargar con todo sin apoyo. ¿Qué es lo que más pesa ahora mismo?"
-    if "triste" in texto or "vacío" in texto:
-        return "Gracias por compartirlo conmigo. No voy a minimizar lo que sientes. ¿Desde cuándo notas esta tristeza tan presente?"
-    if "hola" in texto or "buenas" in texto:
-        return f"Hola, {req.user_name}. Me alegra verte aquí. ¿Cómo te estás sintiendo hoy, de verdad?"
-    return f"Te escucho, {req.user_name}. Cuéntame qué parte de esto te gustaría entender mejor."
+    if any(x in texto for x in ["ansiedad", "nervios", "ansiosa", "ansioso"]):
+        return (
+            f"Lo que describes suena a que tu sistema de alerta está muy activo ahora mismo. "
+            f"Vamos a bajar un poco el ritmo antes de analizar nada. "
+            f"¿Qué fue lo primero que lo disparó hoy, si pudieras identificar un momento concreto?"
+        )
+    if any(x in texto for x in ["pareja", "relación", "me ignoró", "no respondió", "me dejó"]):
+        return (
+            "Cuando hay silencio o distancia de alguien que importa, la mente empieza a construir historias rápido. "
+            "Eso duele de forma muy real. "
+            "¿Qué fue lo primero que pensaste cuando pasó eso?"
+        )
+    if any(x in texto for x in ["agot", "cans", "burnout", "no puedo más"]):
+        return (
+            "Eso suena a más que cansancio físico: es ese punto en el que hasta las cosas pequeñas empiezan a pesar demasiado. "
+            "Antes de pedirte que hagas algo, cuéntame un poco más: "
+            "¿este agotamiento viene más de personas, de trabajo o de sentir que no paras nunca?"
+        )
+    if any(x in texto for x in ["sola", "solo", "nadie me entiende", "incomprendida"]):
+        return (
+            "Sentirse sola aunque haya gente alrededor es uno de los cansancios más silenciosos que existen. "
+            "¿Hay algo concreto que pasó recientemente que lo intensificó, "
+            "o es más una sensación que viene de hace tiempo?"
+        )
+    if any(x in texto for x in ["triste", "tristeza", "vacío", "vacía", "llorar", "llor"]):
+        return (
+            "La tristeza a veces no pide explicación, simplemente aparece y pesa. "
+            "No voy a pedirte que la expliques si no puedes. "
+            "¿Quieres contarme qué pasó, o prefieres que empecemos por lo que sientes en el cuerpo ahora mismo?"
+        )
+    if any(x in texto for x in ["dormir", "insomnio", "no puedo dormir", "desvelada"]):
+        return (
+            "Qué frustrante es cuando el cuerpo está cansado pero la mente no baja el volumen. "
+            "No voy a decirte simplemente que te relajes, porque sé que no funciona así. "
+            "¿Quieres que hagamos una respiración breve juntas, o prefieres vaciar primero lo que tienes en la cabeza?"
+        )
+    if any(x in texto for x in ["fatal", "horrible", "mal", "pésimo", "todo está mal"]):
+        return (
+            "Uf, sentirse así sin poder ponerle nombre exacto agota todavía más. "
+            "No tenemos que resolver nada de golpe. "
+            "¿Se siente más como tristeza, ansiedad, cansancio o algo más como estar saturada de todo?"
+        )
+    if any(x in texto for x in ["hola", "buenas", "buenos días", "buenas tardes"]):
+        return (
+            f"Hola, me alegra que estés aquí. "
+            f"¿Cómo estás hoy, de verdad? No hace falta que todo esté bien ni mal, solo cuéntame."
+        )
+    return (
+        f"Te escucho. "
+        f"¿Quieres empezar por contarme qué pasó, cómo te sientes ahora mismo, "
+        f"o prefieres que te ayude a ordenar lo que tienes en la cabeza?"
+    )
+
+
+_STYLE_INSTRUCTIONS = {
+    "suave": (
+        "Tu tono es suave, cálido, sin prisa. Validas antes de proponer nada. "
+        "Usas frases cortas y naturales. No das listas de consejos."
+    ),
+    "directa": (
+        "Tu tono es claro y directo, sin rodeos, pero con calidez. "
+        "Vas al punto importante rápido. Preguntas concretas, no vagas."
+    ),
+    "motivadora": (
+        "Tu tono es animador, activo, con energía positiva real (no forzada). "
+        "Destacas los recursos que ya tiene la persona. Invitas a la acción pequeña."
+    ),
+    "reflexiva": (
+        "Tu tono es pausado, contemplativo. Invitas a mirar hacia adentro. "
+        "Haces preguntas que abren espacio, no que buscan solución inmediata."
+    ),
+}
+
+_FOCUS_CONTEXT = {
+    "ansiedad": "La persona está trabajando su ansiedad. Cuando aparezca activación, ayúdale a bajar el ritmo primero.",
+    "estres": "La persona está manejando estrés. Ayúdale a identificar la fuente y a sentir que no está sola.",
+    "dormir": "La persona tiene dificultades para dormir. Evita decirle simplemente que se relaje; ofrece algo concreto.",
+    "desahogarme": "La persona necesita ser escuchada, no soluciones. Escucha primero, valida segundo, pregunta después.",
+    "diario": "La persona quiere explorar sus emociones mediante escritura. Ayúdale a articular lo que siente.",
+    "autoconocimiento": "La persona quiere conocerse mejor. Ayúdale a notar patrones y a observarse sin juzgarse.",
+    "general": "Adapta tu respuesta al contenido emocional del mensaje.",
+}
 
 
 def build_system_prompt(req: ChatRequest, memory_lines: list[str], journal_lines: list[str]) -> str:
     memories = "\n".join(f"- {m}" for m in memory_lines) if memory_lines else "- Sin memoria previa relevante."
     journals = "\n".join(f"- {j}" for j in journal_lines) if journal_lines else "- Sin registros recientes."
 
-    return f"""
-Eres {req.assistant_name}, una asistente emocional cálida, elegante, útil y humana para una app llamada PsicologIA.
-Hablas en español.
-Tu tono debe sentirse cercano, suave, reconfortante y profesional.
-No digas que eres terapeuta ni sustituyes atención profesional, salvo que sea necesario por seguridad.
-No seas fría ni demasiado larga.
-Responde con 2 a 5 frases.
-Haz seguimiento emocional real y continuidad.
+    style_key = (req.companion_style or "suave").lower()
+    style_instr = _STYLE_INSTRUCTIONS.get(style_key, _STYLE_INSTRUCTIONS["suave"])
 
-Datos del usuario:
+    focus_key = (req.focus_area or "general").lower()
+    focus_instr = _FOCUS_CONTEXT.get(focus_key, _FOCUS_CONTEXT["general"])
+
+    return f"""Eres {req.assistant_name}, una asistente emocional de la app PsicologIA.
+Hablas en español. Eres humana, cálida y específica — nada genérico.
+
+TONO: {style_instr}
+
+CONTEXTO DE LA PERSONA:
 - Nombre: {req.user_name}
-- Área principal: {req.focus_area}
+- Área principal: {focus_key}
+- Instrucción de contexto: {focus_instr}
 
-Memoria emocional relevante:
+MEMORIA EMOCIONAL:
 {memories}
 
-Últimos registros de diario:
+DIARIO RECIENTE:
 {journals}
 
-Si detectas riesgo grave, autolesión o suicidio:
-- prioriza seguridad
-- recomienda ayuda inmediata
-- sugiere contactar emergencias o una persona de confianza
+REGLAS DE RESPUESTA — sigue TODAS:
+1. Refleja algo CONCRETO del mensaje del usuario. No respondas de forma genérica.
+2. Valida emocionalmente sin exagerar: "Eso suena pesado" > "Claro que sí, entiendo perfectamente cómo te sientes".
+3. Varía tus preguntas. Evita repetir siempre "¿cómo te sientes con eso?" o "¿quieres contarme más?".
+4. Cuando el usuario parece bloqueado, ofrece opciones: "¿Quieres desahogarte, ordenar lo que pasó o calmarte primero?"
+5. Responde con 3 a 5 frases. Ni más corto (frío) ni más largo (agotador).
+6. No uses frases de plantilla como "Estoy aquí para ti", "Te escucho", "Entiendo lo que dices" de forma repetida.
+7. No suenes como psicóloga clínica rígida. Suena como una amiga formada y empática.
+8. No des diagnósticos. No uses lenguaje técnico sin explicarlo.
+9. Mantén el hilo de la conversación reciente. No empieces desde cero.
+10. Si el usuario habló de algo (pareja, trabajo, insomnio), continúa ESE hilo.
 
-Tu objetivo:
-- hacer que el usuario se sienta escuchado
-- recordar lo importante
-- continuar el proceso emocional
-- dar contención y una siguiente pregunta útil
+SEGURIDAD:
+Si detectas riesgo grave, autolesión o suicidio:
+- Prioriza seguridad antes que cualquier otra cosa.
+- Recomienda ayuda inmediata (emergencias, persona de confianza, línea de crisis).
+- Sé directa y cálida, no clínica ni alarmante.
+- En España: Teléfono de la Esperanza 717 003 717. En Colombia: Línea 106.
+
+EJEMPLOS DE BUEN TONO (úsalos como referencia de estilo, no como plantilla):
+- Usuario: "Me siento fatal sin saber por qué." → "Uf, eso agota el doble: sentirse mal encima de no poder explicárselo. No tenemos que resolverlo ahora. ¿Se siente más como tristeza, ansiedad o simplemente vacío?"
+- Usuario: "Mi pareja no respondió y me activé mucho." → "Entiendo por qué eso te activó. Muchas veces lo que duele no es el silencio, sino la historia que la mente empieza a construir. ¿Qué fue lo primero que pensaste?"
+- Usuario: "No puedo dormir." → "Qué frustrante es cuando el cuerpo está cansado y la mente no baja el volumen. ¿Quieres que te guíe con una respiración breve o prefieres vaciar primero lo que tienes en la cabeza?"
 """.strip()
 
 
