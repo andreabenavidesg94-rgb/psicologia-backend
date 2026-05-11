@@ -4,6 +4,13 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+# Logger de billing — todos los errores de Google Play aparecen en Render Logs
+_log = logging.getLogger("psicologia.billing")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,17 +25,7 @@ from firebase_admin import auth, credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ============================================================
-# CONFIGURACIÓN GENERAL
-# ============================================================
-
 load_dotenv()
-
-_log = logging.getLogger("psicologia.billing")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -44,17 +41,12 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
-    pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-
-# ============================================================
-# FIREBASE / GOOGLE PLAY
-# ============================================================
 
 def init_firebase() -> None:
     if firebase_admin._apps:
@@ -76,20 +68,6 @@ def build_android_publisher():
     return build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
 
 
-def google_verify_subscription(package_name: str, purchase_token: str) -> dict[str, Any]:
-    service = build_android_publisher()
-    return (
-        service.purchases()
-        .subscriptionsv2()
-        .get(packageName=package_name, token=purchase_token)
-        .execute()
-    )
-
-
-# ============================================================
-# UTILIDADES
-# ============================================================
-
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -106,7 +84,6 @@ def parse_google_rfc3339(value: Optional[str]) -> Optional[datetime]:
 def verify_firebase_token(authorization: Optional[str]) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Falta Authorization Bearer token")
-
     token = authorization.replace("Bearer ", "", 1).strip()
     if not token:
         raise HTTPException(status_code=401, detail="Firebase token vacío")
@@ -115,6 +92,107 @@ def verify_firebase_token(authorization: Optional[str]) -> dict[str, Any]:
         return auth.verify_id_token(token)
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Firebase token inválido: {str(e)}")
+
+
+class MemoryItem(Base):
+    __tablename__ = "memory_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(255), index=True, nullable=False)
+    kind = Column(String(50), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=now_utc)
+
+
+class ChatTurn(Base):
+    __tablename__ = "chat_turns"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(255), index=True, nullable=False)
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=now_utc)
+
+
+class JournalEntry(Base):
+    __tablename__ = "journal_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(255), index=True, nullable=False)
+    title = Column(String(255), nullable=True)
+    text = Column(Text, nullable=False)
+    emotion = Column(String(50), nullable=True)
+    intensity = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=now_utc)
+
+
+class SubscriptionEntitlement(Base):
+    __tablename__ = "subscription_entitlements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(255), index=True, nullable=False)
+    firebase_uid = Column(String(255), index=True, nullable=False)
+    email = Column(String(255), nullable=True)
+    product_id = Column(String(255), nullable=False)
+    purchase_token = Column(Text, nullable=False, unique=True)
+    plan = Column(String(50), nullable=False, default="free")
+    source = Column(String(50), nullable=False, default="google_play")
+    status = Column(String(50), nullable=False, default="inactive")
+    is_active = Column(Boolean, nullable=False, default=False)
+    expiry_date = Column(DateTime, nullable=True)
+    latest_order_id = Column(String(255), nullable=True)
+    raw_payload = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="PsicologIA PRO Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def startup_event():
+    init_firebase()
+
+
+class ChatRequest(BaseModel):
+    mensaje: str
+    user_name: str | None = "Tú"
+    assistant_name: str | None = "Andrea"
+    focus_area: str | None = "general"
+    companion_style: str | None = "suave"   # suave | directa | motivadora | reflexiva
+    remembered_topic: str | None = ""
+    user_id: str | None = None
+
+
+class DiarioRequest(BaseModel):
+    texto: str
+    title: str | None = None
+    user_name: str | None = "Tú"
+    assistant_name: str | None = "Andrea"
+    focus_area: str | None = "Ansiedad"
+    user_id: str | None = None
+
+
+class VerifySubscriptionRequest(BaseModel):
+    purchase_token: str
+    product_id: str
+    package_name: Optional[str] = None
+
+
+class RestoreSubscriptionRequest(BaseModel):
+    purchase_tokens: list[str]
+    product_id_hint: Optional[str] = None
+    package_name: Optional[str] = None
 
 
 def normalize_user_id(user_id: Optional[str], user_name: Optional[str]) -> str:
@@ -126,10 +204,10 @@ def normalize_user_id(user_id: Optional[str], user_name: Optional[str]) -> str:
 
 
 def map_plan_from_product_id(product_id: str) -> str:
-    value = (product_id or "").lower()
-    if "premium" in value:
+    product_id = product_id.lower()
+    if "premium" in product_id:
         return "premium"
-    if "plus" in value:
+    if "plus" in product_id:
         return "plus"
     return "free"
 
@@ -137,17 +215,17 @@ def map_plan_from_product_id(product_id: str) -> str:
 def map_status_from_google_payload(payload: dict[str, Any]) -> tuple[str, bool]:
     state = (payload.get("subscriptionState") or "").upper()
 
-    if state in [
-        "SUBSCRIPTION_STATE_ACTIVE",
-        "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
-    ]:
+    if state == "SUBSCRIPTION_STATE_ACTIVE":
+        return "active", True
+    if state == "SUBSCRIPTION_STATE_IN_GRACE_PERIOD":
         return "active", True
     if state == "SUBSCRIPTION_STATE_ON_HOLD":
         return "on_hold", False
     if state == "SUBSCRIPTION_STATE_PAUSED":
         return "paused", False
     if state == "SUBSCRIPTION_STATE_CANCELED":
-        # Cancelada pero puede seguir activa hasta expiryTime.
+        # En Google Play, cancelada no siempre significa vencida:
+        # el usuario puede haber cancelado la renovación, pero conserva acceso hasta expiryTime.
         expiry_date = extract_expiry_date(payload)
         if expiry_date and expiry_date > now_utc():
             return "active", True
@@ -179,6 +257,13 @@ def extract_order_id(payload: dict[str, Any]) -> Optional[str]:
 
 
 def extract_product_id_from_payload(payload: dict[str, Any], hint: str = "") -> str:
+    """
+    Extrae el product_id del payload de subscriptionsv2 de Google Play.
+
+    La API devuelve lineItems[].productId.
+    Si hint está presente y es un product_id conocido, lo usa directamente
+    (evita ambigüedad cuando hay múltiples lineItems).
+    """
     if hint and hint.strip():
         return hint.strip()
 
@@ -189,155 +274,29 @@ def extract_product_id_from_payload(payload: dict[str, Any], hint: str = "") -> 
             _log.info(f"product_id extraído de lineItems: {pid}")
             return pid
 
+    # Fallback: intentar leer desde el campo de nivel raíz (versiones antiguas de la API)
     pid = (payload.get("productId") or "").strip()
     if pid:
-        _log.info(f"product_id extraído de raíz: {pid}")
+        _log.info(f"product_id extraído de raíz del payload: {pid}")
         return pid
 
     _log.warning(
-        f"No se pudo extraer product_id. subscriptionState={payload.get('subscriptionState')} "
+        f"No se pudo extraer product_id del payload. "
+        f"subscriptionState={payload.get('subscriptionState')} "
         f"lineItems_count={len(line_items)}"
     )
     return ""
 
 
-def entitlement_to_response(row: Optional["SubscriptionEntitlement"]) -> dict[str, Any]:
-    if row is None:
-        return {
-            "plan": "free",
-            "status": "inactive",
-            "is_active": False,
-            "expiry_date": None,
-            "product_id": None,
-        }
+def google_verify_subscription(package_name: str, purchase_token: str) -> dict[str, Any]:
+    service = build_android_publisher()
+    return (
+        service.purchases()
+        .subscriptionsv2()
+        .get(packageName=package_name, token=purchase_token)
+        .execute()
+    )
 
-    return {
-        "plan": row.plan if row.is_active else "free",
-        "status": row.status,
-        "is_active": bool(row.is_active),
-        "expiry_date": row.expiry_date.isoformat() if row.expiry_date else None,
-        "product_id": row.product_id,
-    }
-
-
-# ============================================================
-# BASE DE DATOS
-# ============================================================
-
-class MemoryItem(Base):
-    __tablename__ = "memory_items"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(255), index=True, nullable=False)
-    kind = Column(String(50), nullable=False)
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=now_utc)
-
-
-class ChatTurn(Base):
-    __tablename__ = "chat_turns"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(255), index=True, nullable=False)
-    role = Column(String(20), nullable=False)
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=now_utc)
-
-
-class JournalEntry(Base):
-    __tablename__ = "journal_entries"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(255), index=True, nullable=False)
-    title = Column(String(255), nullable=True)
-    text = Column(Text, nullable=False)
-    emotion = Column(String(50), nullable=True)
-    intensity = Column(Integer, nullable=True)
-    created_at = Column(DateTime(timezone=True), default=now_utc)
-
-
-class SubscriptionEntitlement(Base):
-    __tablename__ = "subscription_entitlements"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(255), index=True, nullable=False)
-    firebase_uid = Column(String(255), index=True, nullable=False)
-    email = Column(String(255), nullable=True)
-    product_id = Column(String(255), nullable=False)
-    purchase_token = Column(Text, nullable=False, unique=True)
-    plan = Column(String(50), nullable=False, default="free")
-    source = Column(String(50), nullable=False, default="google_play")
-    status = Column(String(50), nullable=False, default="inactive")
-    is_active = Column(Boolean, nullable=False, default=False)
-    expiry_date = Column(DateTime(timezone=True), nullable=True)
-    latest_order_id = Column(String(255), nullable=True)
-    raw_payload = Column(Text, nullable=True)
-    last_verified_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), default=now_utc)
-    updated_at = Column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
-
-
-Base.metadata.create_all(bind=engine)
-
-
-# ============================================================
-# APP
-# ============================================================
-
-app = FastAPI(title="PsicologIA PRO Backend")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-def startup_event():
-    init_firebase()
-
-
-# ============================================================
-# MODELOS REQUEST
-# ============================================================
-
-class ChatRequest(BaseModel):
-    mensaje: str
-    user_name: str | None = "Tú"
-    assistant_name: str | None = "Andrea"
-    focus_area: str | None = "general"
-    companion_style: str | None = "suave"
-    remembered_topic: str | None = ""
-    user_id: str | None = None
-
-
-class DiarioRequest(BaseModel):
-    texto: str
-    title: str | None = None
-    user_name: str | None = "Tú"
-    assistant_name: str | None = "Andrea"
-    focus_area: str | None = "Ansiedad"
-    user_id: str | None = None
-
-
-class VerifySubscriptionRequest(BaseModel):
-    purchase_token: str
-    product_id: str
-    package_name: Optional[str] = None
-
-
-class RestoreSubscriptionRequest(BaseModel):
-    purchase_tokens: list[str]
-    product_id_hint: Optional[str] = None
-    package_name: Optional[str] = None
-
-
-# ============================================================
-# BILLING HELPERS
-# ============================================================
 
 def upsert_entitlement(
     db,
@@ -348,12 +307,19 @@ def upsert_entitlement(
     product_id: str,
     payload: dict[str, Any],
 ) -> SubscriptionEntitlement:
+    """
+    Vincula un purchase_token a UN SOLO usuario Firebase.
+
+    Google Play restaura compras según la cuenta Google del dispositivo,
+    no según el login interno de Firebase. Si el mismo token ya fue vinculado
+    a otro firebase_uid, NO debe reasignarse automáticamente a la cuenta actual.
+    Esto evita que una suscripción comprada por una cuenta se arrastre a otra.
+    """
     plan = map_plan_from_product_id(product_id)
     status, is_active = map_status_from_google_payload(payload)
     expiry_date = extract_expiry_date(payload)
     latest_order_id = extract_order_id(payload)
 
-    # Si Google dice activa pero expiry ya venció, se fuerza a expirada.
     if expiry_date and expiry_date < now_utc():
         status = "expired"
         is_active = False
@@ -387,7 +353,6 @@ def upsert_entitlement(
             expiry_date=expiry_date,
             latest_order_id=latest_order_id,
             raw_payload=json.dumps(payload, ensure_ascii=False),
-            last_verified_at=now_utc(),
         )
         db.add(existing)
     else:
@@ -400,7 +365,6 @@ def upsert_entitlement(
         existing.expiry_date = expiry_date
         existing.latest_order_id = latest_order_id
         existing.raw_payload = json.dumps(payload, ensure_ascii=False)
-        existing.last_verified_at = now_utc()
         existing.updated_at = now_utc()
 
     db.commit()
@@ -412,11 +376,7 @@ def get_current_entitlement(db, firebase_uid: str) -> Optional[SubscriptionEntit
     row = (
         db.query(SubscriptionEntitlement)
         .filter(SubscriptionEntitlement.firebase_uid == firebase_uid)
-        .order_by(
-            SubscriptionEntitlement.is_active.desc(),
-            SubscriptionEntitlement.expiry_date.desc().nullslast(),
-            SubscriptionEntitlement.updated_at.desc(),
-        )
+        .order_by(SubscriptionEntitlement.is_active.desc(), SubscriptionEntitlement.updated_at.desc())
         .first()
     )
 
@@ -432,9 +392,8 @@ def get_current_entitlement(db, firebase_uid: str) -> Optional[SubscriptionEntit
 
 def refresh_entitlement_with_google(db, row: SubscriptionEntitlement) -> SubscriptionEntitlement:
     """
-    Cada vez que /billing/my-plan se consulta, el backend puede volver a validar
-    el purchase_token guardado. Así el usuario NO tiene que tocar restaurar compras
-    cada vez que abre la app.
+    Revalida automáticamente el purchase_token guardado.
+    Esto evita que el usuario tenga que pulsar Restaurar compras cada vez que abre la app.
     """
     token_preview = (row.purchase_token or "")[:8] + "…"
     try:
@@ -465,237 +424,17 @@ def refresh_entitlement_with_google(db, row: SubscriptionEntitlement) -> Subscri
         return row
 
 
-# ============================================================
-# ENDPOINTS BASE
-# ============================================================
-
-@app.get("/")
-def root():
-    return {"ok": True, "message": "Backend PsicologIA PRO funcionando"}
-
-
-@app.get("/health")
-def health():
+def entitlement_response(row: Optional[SubscriptionEntitlement]) -> dict[str, Any]:
+    if row is None:
+        return {"plan": "free", "status": "inactive", "is_active": False, "expiry_date": None, "product_id": None}
     return {
-        "status": "ok",
-        "openai_configured": bool(OPENAI_API_KEY),
-        "model": OPENAI_MODEL,
-        "database_url_set": bool(DATABASE_URL),
-        "firebase_configured": bool(FIREBASE_SERVICE_ACCOUNT_PATH),
-        "google_play_configured": bool(GOOGLE_PLAY_SERVICE_ACCOUNT_PATH),
-        "package_name": ANDROID_PACKAGE_NAME,
+        "plan": row.plan if row.is_active else "free",
+        "status": row.status,
+        "is_active": row.is_active,
+        "expiry_date": row.expiry_date.isoformat() if row.expiry_date else None,
+        "product_id": row.product_id,
     }
 
-
-# ============================================================
-# BILLING ENDPOINTS PROFESIONALES
-# ============================================================
-
-@app.get("/billing/my-plan")
-def get_my_plan(authorization: Optional[str] = Header(default=None)):
-    """
-    Endpoint que debe llamar la app al iniciar y al volver del background.
-
-    Si ya existe una compra guardada en la base de datos, este endpoint la revalida
-    automáticamente con Google Play y devuelve el plan real. Así el usuario no tiene
-    que pulsar Restaurar compra manualmente cada vez.
-    """
-    decoded = verify_firebase_token(authorization)
-    firebase_uid = decoded["uid"]
-
-    db = SessionLocal()
-    try:
-        row = get_current_entitlement(db, firebase_uid)
-        if row is None:
-            return entitlement_to_response(None)
-
-        refreshed = refresh_entitlement_with_google(db, row)
-        return entitlement_to_response(refreshed)
-    finally:
-        db.close()
-
-
-@app.post("/billing/verify")
-def verify_subscription(req: VerifySubscriptionRequest, authorization: Optional[str] = Header(default=None)):
-    """
-    Este endpoint debe llamarse justo después de una compra nueva.
-    Guarda el purchase_token para que luego /billing/my-plan pueda mantener
-    la suscripción activa sin restaurar manualmente.
-    """
-    decoded = verify_firebase_token(authorization)
-    firebase_uid = decoded["uid"]
-    email = decoded.get("email")
-    package_name = (req.package_name or ANDROID_PACKAGE_NAME).strip()
-
-    if not req.purchase_token.strip():
-        raise HTTPException(status_code=400, detail="purchase_token obligatorio")
-    if not req.product_id.strip():
-        raise HTTPException(status_code=400, detail="product_id obligatorio")
-
-    token_clean = req.purchase_token.strip()
-    token_preview = token_clean[:8] + "…"
-
-    db = SessionLocal()
-    try:
-        _log.info(
-            f"verify start | uid={firebase_uid[:8]}… | token={token_preview} | "
-            f"product_id={req.product_id} | package={package_name}"
-        )
-
-        payload = google_verify_subscription(package_name=package_name, purchase_token=token_clean)
-
-        row = upsert_entitlement(
-            db=db,
-            firebase_uid=firebase_uid,
-            email=email,
-            user_id=f"firebase::{firebase_uid}",
-            purchase_token=token_clean,
-            product_id=req.product_id.strip(),
-            payload=payload,
-        )
-
-        _log.info(
-            f"verify done | uid={firebase_uid[:8]}… | token={token_preview} | "
-            f"plan={row.plan} | active={row.is_active} | status={row.status}"
-        )
-
-        response = entitlement_to_response(row)
-        response["ok"] = True
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        _log.error(f"verify failed | token={token_preview} | error={type(e).__name__}: {e}")
-        raise HTTPException(status_code=400, detail=f"No se pudo verificar la suscripción: {str(e)}")
-    finally:
-        db.close()
-
-
-@app.post("/billing/restore")
-def restore_subscription(req: RestoreSubscriptionRequest, authorization: Optional[str] = Header(default=None)):
-    """
-    Endpoint manual de restauración.
-    Se usa solo si el usuario reinstala la app, cambia de dispositivo o Google Play
-    devuelve compras pendientes que todavía no están guardadas en el backend.
-    """
-    decoded = verify_firebase_token(authorization)
-    firebase_uid = decoded["uid"]
-    email = decoded.get("email")
-    package_name = (req.package_name or ANDROID_PACKAGE_NAME).strip()
-
-    if not req.purchase_tokens:
-        raise HTTPException(status_code=400, detail="Debes enviar al menos un purchase_token")
-
-    _log.info(
-        f"restore start | uid={firebase_uid[:8]}… | tokens_count={len(req.purchase_tokens)} | package={package_name}"
-    )
-
-    db = SessionLocal()
-    restored_rows = []
-    errors = []
-
-    try:
-        for token in req.purchase_tokens:
-            token_clean = token.strip()
-            if not token_clean:
-                continue
-
-            token_preview = token_clean[:8] + "…"
-
-            try:
-                payload = google_verify_subscription(package_name=package_name, purchase_token=token_clean)
-            except Exception as gplay_exc:
-                _log.error(
-                    f"Google Play verify failed | token={token_preview} | "
-                    f"error={type(gplay_exc).__name__}: {gplay_exc}"
-                )
-                errors.append({
-                    "token_preview": token_preview,
-                    "stage": "google_play_verify",
-                    "error": f"{type(gplay_exc).__name__}: {str(gplay_exc)}",
-                })
-                continue
-
-            product_id = extract_product_id_from_payload(payload, hint=req.product_id_hint or "")
-
-            if not product_id:
-                _log.warning(
-                    f"product_id vacío | token={token_preview} | state={payload.get('subscriptionState')}"
-                )
-                errors.append({
-                    "token_preview": token_preview,
-                    "stage": "product_id_extraction",
-                    "error": "No se pudo determinar product_id desde Google Play",
-                    "subscription_state": payload.get("subscriptionState", "unknown"),
-                })
-                continue
-
-            sub_state = payload.get("subscriptionState", "unknown")
-            _log.info(
-                f"Google Play OK | token={token_preview} | product_id={product_id} | state={sub_state}"
-            )
-
-            try:
-                row = upsert_entitlement(
-                    db=db,
-                    firebase_uid=firebase_uid,
-                    email=email,
-                    user_id=f"firebase::{firebase_uid}",
-                    purchase_token=token_clean,
-                    product_id=product_id,
-                    payload=payload,
-                )
-                restored_rows.append(row)
-                _log.info(
-                    f"entitlement upserted | token={token_preview} | "
-                    f"plan={row.plan} | is_active={row.is_active} | status={row.status}"
-                )
-            except HTTPException as h:
-                detail = h.detail if isinstance(h.detail, str) else str(h.detail)
-                _log.warning(
-                    f"upsert HTTPException {h.status_code} | token={token_preview} | detail={detail}"
-                )
-                errors.append({
-                    "token_preview": token_preview,
-                    "stage": "upsert_entitlement",
-                    "http_status": h.status_code,
-                    "error": detail,
-                })
-            except Exception as db_exc:
-                _log.error(
-                    f"upsert DB error | token={token_preview} | error={type(db_exc).__name__}: {db_exc}"
-                )
-                errors.append({
-                    "token_preview": token_preview,
-                    "stage": "upsert_entitlement",
-                    "error": f"{type(db_exc).__name__}: {str(db_exc)}",
-                })
-
-        current = get_current_entitlement(db, firebase_uid)
-        if current:
-            current = refresh_entitlement_with_google(db, current)
-
-        final_response = entitlement_to_response(current)
-        final_response.update({
-            "ok": True,
-            "restored_count": len(restored_rows),
-            "errors": errors,
-        })
-
-        _log.info(
-            f"restore done | uid={firebase_uid[:8]}… | restored={len(restored_rows)} | "
-            f"errors={len(errors)} | final_plan={final_response['plan']}"
-        )
-
-        return final_response
-    finally:
-        db.close()
-
-
-# ============================================================
-# CHAT / DIARIO HELPERS
-# ============================================================
 
 def save_chat_turn(db, user_id: str, role: str, content: str):
     db.add(ChatTurn(user_id=user_id, role=role, content=content))
@@ -728,6 +467,7 @@ def get_recent_journal(db, user_id: str, limit: int = 5):
 
 def heuristic_memory_update(message: str) -> Optional[str]:
     lower = message.lower()
+
     if any(x in lower for x in ["ansiedad", "nervios", "ataque"]):
         return "La ansiedad aparece con frecuencia y conviene trabajarla con más calma y regulación."
     if any(x in lower for x in ["pareja", "relación", "amor"]):
@@ -743,29 +483,79 @@ def heuristic_memory_update(message: str) -> Optional[str]:
 
 def fallback_chat_reply(req: ChatRequest) -> str:
     texto = req.mensaje.lower()
+    nombre = (req.user_name or "").strip() or "Tú"
 
     if any(x in texto for x in ["ansiedad", "nervios", "ansiosa", "ansioso"]):
-        return "Lo que describes suena a que tu sistema de alerta está muy activo ahora mismo. Vamos a bajar un poco el ritmo antes de analizar nada. ¿Qué fue lo primero que lo disparó hoy?"
+        return (
+            f"Lo que describes suena a que tu sistema de alerta está muy activo ahora mismo. "
+            f"Vamos a bajar un poco el ritmo antes de analizar nada. "
+            f"¿Qué fue lo primero que lo disparó hoy, si pudieras identificar un momento concreto?"
+        )
     if any(x in texto for x in ["pareja", "relación", "me ignoró", "no respondió", "me dejó"]):
-        return "Cuando hay silencio o distancia de alguien que importa, la mente empieza a construir historias rápido. Eso duele de forma muy real. ¿Qué fue lo primero que pensaste cuando pasó eso?"
+        return (
+            "Cuando hay silencio o distancia de alguien que importa, la mente empieza a construir historias rápido. "
+            "Eso duele de forma muy real. "
+            "¿Qué fue lo primero que pensaste cuando pasó eso?"
+        )
     if any(x in texto for x in ["agot", "cans", "burnout", "no puedo más"]):
-        return "Eso suena a más que cansancio físico: es ese punto en el que hasta las cosas pequeñas empiezan a pesar demasiado. ¿Este agotamiento viene más de personas, de trabajo o de sentir que no paras nunca?"
+        return (
+            "Eso suena a más que cansancio físico: es ese punto en el que hasta las cosas pequeñas empiezan a pesar demasiado. "
+            "Antes de pedirte que hagas algo, cuéntame un poco más: "
+            "¿este agotamiento viene más de personas, de trabajo o de sentir que no paras nunca?"
+        )
     if any(x in texto for x in ["sola", "solo", "nadie me entiende", "incomprendida"]):
-        return "Sentirse sola aunque haya gente alrededor es uno de los cansancios más silenciosos que existen. ¿Hay algo concreto que pasó recientemente que lo intensificó?"
+        return (
+            "Sentirse sola aunque haya gente alrededor es uno de los cansancios más silenciosos que existen. "
+            "¿Hay algo concreto que pasó recientemente que lo intensificó, "
+            "o es más una sensación que viene de hace tiempo?"
+        )
     if any(x in texto for x in ["triste", "tristeza", "vacío", "vacía", "llorar", "llor"]):
-        return "La tristeza a veces no pide explicación, simplemente aparece y pesa. ¿Quieres contarme qué pasó, o prefieres que empecemos por lo que sientes en el cuerpo ahora mismo?"
+        return (
+            "La tristeza a veces no pide explicación, simplemente aparece y pesa. "
+            "No voy a pedirte que la expliques si no puedes. "
+            "¿Quieres contarme qué pasó, o prefieres que empecemos por lo que sientes en el cuerpo ahora mismo?"
+        )
     if any(x in texto for x in ["dormir", "insomnio", "no puedo dormir", "desvelada"]):
-        return "Qué frustrante es cuando el cuerpo está cansado pero la mente no baja el volumen. ¿Quieres que hagamos una respiración breve juntas, o prefieres vaciar primero lo que tienes en la cabeza?"
+        return (
+            "Qué frustrante es cuando el cuerpo está cansado pero la mente no baja el volumen. "
+            "No voy a decirte simplemente que te relajes, porque sé que no funciona así. "
+            "¿Quieres que hagamos una respiración breve juntas, o prefieres vaciar primero lo que tienes en la cabeza?"
+        )
+    if any(x in texto for x in ["fatal", "horrible", "mal", "pésimo", "todo está mal"]):
+        return (
+            "Uf, sentirse así sin poder ponerle nombre exacto agota todavía más. "
+            "No tenemos que resolver nada de golpe. "
+            "¿Se siente más como tristeza, ansiedad, cansancio o algo más como estar saturada de todo?"
+        )
     if any(x in texto for x in ["hola", "buenas", "buenos días", "buenas tardes"]):
-        return "Hola, me alegra que estés aquí. ¿Cómo estás hoy, de verdad? No hace falta que todo esté bien ni mal, solo cuéntame."
-    return "Te leo. ¿Quieres empezar por contarme qué pasó, cómo te sientes ahora mismo, o prefieres que te ayude a ordenar lo que tienes en la cabeza?"
+        return (
+            f"Hola, me alegra que estés aquí. "
+            f"¿Cómo estás hoy, de verdad? No hace falta que todo esté bien ni mal, solo cuéntame."
+        )
+    return (
+        f"Te escucho. "
+        f"¿Quieres empezar por contarme qué pasó, cómo te sientes ahora mismo, "
+        f"o prefieres que te ayude a ordenar lo que tienes en la cabeza?"
+    )
 
 
 _STYLE_INSTRUCTIONS = {
-    "suave": "Tu tono es suave, cálido, sin prisa. Validas antes de proponer nada. Usas frases cortas y naturales.",
-    "directa": "Tu tono es claro y directo, sin rodeos, pero con calidez. Vas al punto importante rápido.",
-    "motivadora": "Tu tono es animador, activo, con energía positiva real, no forzada. Invitas a una acción pequeña.",
-    "reflexiva": "Tu tono es pausado, contemplativo. Invitas a mirar hacia adentro sin juzgar.",
+    "suave": (
+        "Tu tono es suave, cálido, sin prisa. Validas antes de proponer nada. "
+        "Usas frases cortas y naturales. No das listas de consejos."
+    ),
+    "directa": (
+        "Tu tono es claro y directo, sin rodeos, pero con calidez. "
+        "Vas al punto importante rápido. Preguntas concretas, no vagas."
+    ),
+    "motivadora": (
+        "Tu tono es animador, activo, con energía positiva real (no forzada). "
+        "Destacas los recursos que ya tiene la persona. Invitas a la acción pequeña."
+    ),
+    "reflexiva": (
+        "Tu tono es pausado, contemplativo. Invitas a mirar hacia adentro. "
+        "Haces preguntas que abren espacio, no que buscan solución inmediata."
+    ),
 }
 
 _FOCUS_CONTEXT = {
@@ -805,12 +595,29 @@ MEMORIA EMOCIONAL:
 DIARIO RECIENTE:
 {journals}
 
-REGLAS:
-1. Refleja algo concreto del mensaje del usuario.
-2. Valida emocionalmente sin exagerar.
-3. Responde con 3 a 5 frases.
-4. No diagnostiques.
-5. Si detectas riesgo grave, autolesión o suicidio, prioriza seguridad y recomienda ayuda inmediata.
+REGLAS DE RESPUESTA — sigue TODAS:
+1. Refleja algo CONCRETO del mensaje del usuario. No respondas de forma genérica.
+2. Valida emocionalmente sin exagerar: "Eso suena pesado" > "Claro que sí, entiendo perfectamente cómo te sientes".
+3. Varía tus preguntas. Evita repetir siempre "¿cómo te sientes con eso?" o "¿quieres contarme más?".
+4. Cuando el usuario parece bloqueado, ofrece opciones: "¿Quieres desahogarte, ordenar lo que pasó o calmarte primero?"
+5. Responde con 3 a 5 frases. Ni más corto (frío) ni más largo (agotador).
+6. No uses frases de plantilla como "Estoy aquí para ti", "Te escucho", "Entiendo lo que dices" de forma repetida.
+7. No suenes como psicóloga clínica rígida. Suena como una amiga formada y empática.
+8. No des diagnósticos. No uses lenguaje técnico sin explicarlo.
+9. Mantén el hilo de la conversación reciente. No empieces desde cero.
+10. Si el usuario habló de algo (pareja, trabajo, insomnio), continúa ESE hilo.
+
+SEGURIDAD:
+Si detectas riesgo grave, autolesión o suicidio:
+- Prioriza seguridad antes que cualquier otra cosa.
+- Recomienda ayuda inmediata (emergencias, persona de confianza, línea de crisis).
+- Sé directa y cálida, no clínica ni alarmante.
+- En España: Teléfono de la Esperanza 717 003 717. En Colombia: Línea 106.
+
+EJEMPLOS DE BUEN TONO (úsalos como referencia de estilo, no como plantilla):
+- Usuario: "Me siento fatal sin saber por qué." → "Uf, eso agota el doble: sentirse mal encima de no poder explicárselo. No tenemos que resolverlo ahora. ¿Se siente más como tristeza, ansiedad o simplemente vacío?"
+- Usuario: "Mi pareja no respondió y me activé mucho." → "Entiendo por qué eso te activó. Muchas veces lo que duele no es el silencio, sino la historia que la mente empieza a construir. ¿Qué fue lo primero que pensaste?"
+- Usuario: "No puedo dormir." → "Qué frustrante es cuando el cuerpo está cansado y la mente no baja el volumen. ¿Quieres que te guíe con una respiración breve o prefieres vaciar primero lo que tienes en la cabeza?"
 """.strip()
 
 
@@ -839,13 +646,13 @@ Mensaje actual del usuario:
         )
         text = (response.output_text or "").strip()
         return text if text else fallback_chat_reply(req)
-    except Exception as exc:
-        _log.error(f"OpenAI chat fallback | error={type(exc).__name__}: {exc}")
+    except Exception:
         return fallback_chat_reply(req)
 
 
 def fallback_diary_analysis(texto: str):
     lower = texto.lower()
+
     emocion = "Calma"
     intensidad = 5
     resumen = "Tu registro quedó guardado correctamente."
@@ -916,14 +723,223 @@ Texto:
             "resumen": str(data.get("resumen", "Tu registro quedó guardado correctamente.")),
             "consejo": str(data.get("consejo", "Vuelve cuando quieras. Lo importante aquí es seguir conectando contigo.")),
         }
-    except Exception as exc:
-        _log.error(f"OpenAI diary fallback | error={type(exc).__name__}: {exc}")
+    except Exception:
         return fallback_diary_analysis(texto)
 
 
-# ============================================================
-# ENDPOINTS CHAT / DIARIO
-# ============================================================
+@app.get("/")
+def root():
+    return {"ok": True, "message": "Backend PsicologIA PRO funcionando"}
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "openai_configured": bool(OPENAI_API_KEY),
+        "model": OPENAI_MODEL,
+        "database_url_set": bool(DATABASE_URL),
+        "firebase_configured": bool(FIREBASE_SERVICE_ACCOUNT_PATH),
+        "google_play_configured": bool(GOOGLE_PLAY_SERVICE_ACCOUNT_PATH),
+        "package_name": ANDROID_PACKAGE_NAME,
+    }
+
+
+@app.get("/billing/my-plan")
+def get_my_plan(authorization: Optional[str] = Header(default=None)):
+    decoded = verify_firebase_token(authorization)
+    firebase_uid = decoded["uid"]
+
+    db = SessionLocal()
+    try:
+        row = get_current_entitlement(db, firebase_uid)
+        if row is None:
+            return entitlement_response(None)
+
+        # Revalidación automática con Google Play usando el token ya guardado.
+        # Si Google está temporalmente indisponible, devolvemos el último estado local.
+        row = refresh_entitlement_with_google(db, row)
+        return entitlement_response(row)
+    finally:
+        db.close()
+
+
+@app.post("/billing/verify")
+def verify_subscription(req: VerifySubscriptionRequest, authorization: Optional[str] = Header(default=None)):
+    decoded = verify_firebase_token(authorization)
+    firebase_uid = decoded["uid"]
+    email = decoded.get("email")
+    package_name = (req.package_name or ANDROID_PACKAGE_NAME).strip()
+
+    if not req.purchase_token.strip():
+        raise HTTPException(status_code=400, detail="purchase_token obligatorio")
+    if not req.product_id.strip():
+        raise HTTPException(status_code=400, detail="product_id obligatorio")
+
+    db = SessionLocal()
+    try:
+        payload = google_verify_subscription(package_name=package_name, purchase_token=req.purchase_token.strip())
+        row = upsert_entitlement(
+            db=db,
+            firebase_uid=firebase_uid,
+            email=email,
+            user_id=f"firebase::{firebase_uid}",
+            purchase_token=req.purchase_token.strip(),
+            product_id=req.product_id.strip(),
+            payload=payload,
+        )
+
+        return {
+            "ok": True,
+            "plan": row.plan if row.is_active else "free",
+            "status": row.status,
+            "is_active": row.is_active,
+            "expiry_date": row.expiry_date.isoformat() if row.expiry_date else None,
+            "product_id": row.product_id,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo verificar la suscripción: {str(e)}")
+    finally:
+        db.close()
+
+
+@app.post("/billing/restore")
+def restore_subscription(req: RestoreSubscriptionRequest, authorization: Optional[str] = Header(default=None)):
+    """
+    Restaura suscripciones verificando cada purchase_token contra Google Play.
+
+    Correcciones respecto a la versión anterior:
+    - Todos los errores de Google Play se imprimen en logs (Render Logs).
+    - El product_id se extrae con extract_product_id_from_payload (robusto).
+    - El 409 token_already_bound se trata como warning, no como error silencioso.
+    - Si Google Play devuelve error HTTP, se loguea el status y el motivo.
+    - No se imprime el purchase_token completo en logs (solo los 8 primeros chars).
+    - Si al menos un token se restaura correctamente, el plan resultante refleja
+      el mejor entitlement activo del usuario.
+    - Los tokens con error devuelven detail en errors[] para que Flutter pueda
+      mostrar un mensaje informativo si lo necesita.
+    """
+    decoded = verify_firebase_token(authorization)
+    firebase_uid = decoded["uid"]
+    email = decoded.get("email")
+    package_name = (req.package_name or ANDROID_PACKAGE_NAME).strip()
+
+    if not req.purchase_tokens:
+        raise HTTPException(status_code=400, detail="Debes enviar al menos un purchase_token")
+
+    _log.info(
+        f"restore_subscription start | uid={firebase_uid[:8]}… | "        f"tokens_count={len(req.purchase_tokens)} | package={package_name}"
+    )
+
+    db = SessionLocal()
+    restored_rows = []
+    errors = []
+
+    try:
+        for token in req.purchase_tokens:
+            token_clean = token.strip()
+            token_preview = token_clean[:8] + "…"  # Nunca imprimir el token completo
+
+            # ── 1. Verificar con Google Play Developer API ────────────────────
+            try:
+                payload = google_verify_subscription(
+                    package_name=package_name,
+                    purchase_token=token_clean,
+                )
+            except Exception as gplay_exc:
+                # Logueamos el error COMPLETO en Render Logs para diagnóstico
+                _log.error(
+                    f"Google Play verify failed | token={token_preview} | "                    f"error={type(gplay_exc).__name__}: {gplay_exc}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "google_play_verify",
+                    "error": f"{type(gplay_exc).__name__}: {str(gplay_exc)}",
+                })
+                continue  # Pasar al siguiente token
+
+            # ── 2. Extraer product_id del payload (robusto) ───────────────────
+            product_id = extract_product_id_from_payload(payload, hint=req.product_id_hint or "")
+
+            if not product_id:
+                _log.warning(
+                    f"product_id vacío tras extracción | token={token_preview} | "                    f"state={payload.get('subscriptionState')}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "product_id_extraction",
+                    "error": "No se pudo determinar product_id desde el payload de Google Play",
+                    "subscription_state": payload.get("subscriptionState", "unknown"),
+                })
+                continue
+
+            # ── 3. Log del estado antes de guardar ────────────────────────────
+            sub_state = payload.get("subscriptionState", "unknown")
+            _log.info(
+                f"Google Play OK | token={token_preview} | "                f"product_id={product_id} | state={sub_state}"
+            )
+
+            # ── 4. Guardar o actualizar en DB ─────────────────────────────────
+            try:
+                row = upsert_entitlement(
+                    db=db,
+                    firebase_uid=firebase_uid,
+                    email=email,
+                    user_id=f"firebase::{firebase_uid}",
+                    purchase_token=token_clean,
+                    product_id=product_id,
+                    payload=payload,
+                )
+                restored_rows.append(row)
+                _log.info(
+                    f"entitlement upserted | token={token_preview} | "                    f"plan={row.plan} | is_active={row.is_active} | status={row.status}"
+                )
+
+            except HTTPException as h:
+                # 409: token ya vinculado a otro firebase_uid — es un warning, no un crash
+                detail = h.detail if isinstance(h.detail, str) else str(h.detail)
+                _log.warning(
+                    f"upsert HTTPException {h.status_code} | token={token_preview} | detail={detail}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "upsert_entitlement",
+                    "http_status": h.status_code,
+                    "error": detail,
+                })
+
+            except Exception as db_exc:
+                _log.error(
+                    f"upsert DB error | token={token_preview} | "                    f"error={type(db_exc).__name__}: {db_exc}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "upsert_entitlement",
+                    "error": f"{type(db_exc).__name__}: {str(db_exc)}",
+                })
+
+        # ── 5. Leer el mejor entitlement activo del usuario ───────────────────
+        current = get_current_entitlement(db, firebase_uid)
+        final_plan = current.plan if (current and current.is_active) else "free"
+
+        _log.info(
+            f"restore_subscription done | uid={firebase_uid[:8]}… | "            f"restored={len(restored_rows)} | errors={len(errors)} | final_plan={final_plan}"
+        )
+
+        return {
+            "ok": True,
+            "restored_count": len(restored_rows),
+            "errors": errors,
+            "plan": final_plan,
+            "status": current.status if current else "inactive",
+            "is_active": current.is_active if current else False,
+            "expiry_date": current.expiry_date.isoformat() if current and current.expiry_date else None,
+            "product_id": current.product_id if current else None,
+        }
+
+    finally:
+        db.close()
+
 
 @app.post("/chat")
 def chat(req: ChatRequest):
