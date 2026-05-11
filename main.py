@@ -1,7 +1,15 @@
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+# Logger de billing — todos los errores de Google Play aparecen en Render Logs
+_log = logging.getLogger("psicologia.billing")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
@@ -241,6 +249,38 @@ def extract_order_id(payload: dict[str, Any]) -> Optional[str]:
         if latest:
             return str(latest)
     return None
+
+
+def extract_product_id_from_payload(payload: dict[str, Any], hint: str = "") -> str:
+    """
+    Extrae el product_id del payload de subscriptionsv2 de Google Play.
+
+    La API devuelve lineItems[].productId.
+    Si hint está presente y es un product_id conocido, lo usa directamente
+    (evita ambigüedad cuando hay múltiples lineItems).
+    """
+    if hint and hint.strip():
+        return hint.strip()
+
+    line_items = payload.get("lineItems") or []
+    for item in line_items:
+        pid = (item.get("productId") or "").strip()
+        if pid:
+            _log.info(f"product_id extraído de lineItems: {pid}")
+            return pid
+
+    # Fallback: intentar leer desde el campo de nivel raíz (versiones antiguas de la API)
+    pid = (payload.get("productId") or "").strip()
+    if pid:
+        _log.info(f"product_id extraído de raíz del payload: {pid}")
+        return pid
+
+    _log.warning(
+        f"No se pudo extraer product_id del payload. "
+        f"subscriptionState={payload.get('subscriptionState')} "
+        f"lineItems_count={len(line_items)}"
+    )
+    return ""
 
 
 def google_verify_subscription(package_name: str, purchase_token: str) -> dict[str, Any]:
@@ -716,6 +756,20 @@ def verify_subscription(req: VerifySubscriptionRequest, authorization: Optional[
 
 @app.post("/billing/restore")
 def restore_subscription(req: RestoreSubscriptionRequest, authorization: Optional[str] = Header(default=None)):
+    """
+    Restaura suscripciones verificando cada purchase_token contra Google Play.
+
+    Correcciones respecto a la versión anterior:
+    - Todos los errores de Google Play se imprimen en logs (Render Logs).
+    - El product_id se extrae con extract_product_id_from_payload (robusto).
+    - El 409 token_already_bound se trata como warning, no como error silencioso.
+    - Si Google Play devuelve error HTTP, se loguea el status y el motivo.
+    - No se imprime el purchase_token completo en logs (solo los 8 primeros chars).
+    - Si al menos un token se restaura correctamente, el plan resultante refleja
+      el mejor entitlement activo del usuario.
+    - Los tokens con error devuelven detail en errors[] para que Flutter pueda
+      mostrar un mensaje informativo si lo necesita.
+    """
     decoded = verify_firebase_token(authorization)
     firebase_uid = decoded["uid"]
     email = decoded.get("email")
@@ -724,50 +778,116 @@ def restore_subscription(req: RestoreSubscriptionRequest, authorization: Optiona
     if not req.purchase_tokens:
         raise HTTPException(status_code=400, detail="Debes enviar al menos un purchase_token")
 
+    _log.info(
+        f"restore_subscription start | uid={firebase_uid[:8]}… | "        f"tokens_count={len(req.purchase_tokens)} | package={package_name}"
+    )
+
     db = SessionLocal()
     restored_rows = []
     errors = []
 
     try:
         for token in req.purchase_tokens:
+            token_clean = token.strip()
+            token_preview = token_clean[:8] + "…"  # Nunca imprimir el token completo
+
+            # ── 1. Verificar con Google Play Developer API ────────────────────
             try:
-                payload = google_verify_subscription(package_name=package_name, purchase_token=token.strip())
-                product_id = req.product_id_hint or ""
-                line_items = payload.get("lineItems") or []
-                if not product_id and line_items:
-                    product_id = (line_items[0].get("productId") or "").strip()
+                payload = google_verify_subscription(
+                    package_name=package_name,
+                    purchase_token=token_clean,
+                )
+            except Exception as gplay_exc:
+                # Logueamos el error COMPLETO en Render Logs para diagnóstico
+                _log.error(
+                    f"Google Play verify failed | token={token_preview} | "                    f"error={type(gplay_exc).__name__}: {gplay_exc}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "google_play_verify",
+                    "error": f"{type(gplay_exc).__name__}: {str(gplay_exc)}",
+                })
+                continue  # Pasar al siguiente token
 
-                if not product_id:
-                    errors.append({"purchase_token": token, "error": "No se pudo determinar product_id"})
-                    continue
+            # ── 2. Extraer product_id del payload (robusto) ───────────────────
+            product_id = extract_product_id_from_payload(payload, hint=req.product_id_hint or "")
 
+            if not product_id:
+                _log.warning(
+                    f"product_id vacío tras extracción | token={token_preview} | "                    f"state={payload.get('subscriptionState')}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "product_id_extraction",
+                    "error": "No se pudo determinar product_id desde el payload de Google Play",
+                    "subscription_state": payload.get("subscriptionState", "unknown"),
+                })
+                continue
+
+            # ── 3. Log del estado antes de guardar ────────────────────────────
+            sub_state = payload.get("subscriptionState", "unknown")
+            _log.info(
+                f"Google Play OK | token={token_preview} | "                f"product_id={product_id} | state={sub_state}"
+            )
+
+            # ── 4. Guardar o actualizar en DB ─────────────────────────────────
+            try:
                 row = upsert_entitlement(
                     db=db,
                     firebase_uid=firebase_uid,
                     email=email,
                     user_id=f"firebase::{firebase_uid}",
-                    purchase_token=token.strip(),
+                    purchase_token=token_clean,
                     product_id=product_id,
                     payload=payload,
                 )
                 restored_rows.append(row)
-            except HTTPException as e:
-                errors.append({"purchase_token": token, "error": e.detail})
-            except Exception as e:
-                errors.append({"purchase_token": token, "error": str(e)})
+                _log.info(
+                    f"entitlement upserted | token={token_preview} | "                    f"plan={row.plan} | is_active={row.is_active} | status={row.status}"
+                )
 
+            except HTTPException as h:
+                # 409: token ya vinculado a otro firebase_uid — es un warning, no un crash
+                detail = h.detail if isinstance(h.detail, str) else str(h.detail)
+                _log.warning(
+                    f"upsert HTTPException {h.status_code} | token={token_preview} | detail={detail}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "upsert_entitlement",
+                    "http_status": h.status_code,
+                    "error": detail,
+                })
+
+            except Exception as db_exc:
+                _log.error(
+                    f"upsert DB error | token={token_preview} | "                    f"error={type(db_exc).__name__}: {db_exc}"
+                )
+                errors.append({
+                    "token_preview": token_preview,
+                    "stage": "upsert_entitlement",
+                    "error": f"{type(db_exc).__name__}: {str(db_exc)}",
+                })
+
+        # ── 5. Leer el mejor entitlement activo del usuario ───────────────────
         current = get_current_entitlement(db, firebase_uid)
+        final_plan = current.plan if (current and current.is_active) else "free"
+
+        _log.info(
+            f"restore_subscription done | uid={firebase_uid[:8]}… | "            f"restored={len(restored_rows)} | errors={len(errors)} | final_plan={final_plan}"
+        )
 
         return {
             "ok": True,
             "restored_count": len(restored_rows),
             "errors": errors,
-            "plan": current.plan if current and current.is_active else "free",
+            "plan": final_plan,
             "status": current.status if current else "inactive",
             "is_active": current.is_active if current else False,
             "expiry_date": current.expiry_date.isoformat() if current and current.expiry_date else None,
             "product_id": current.product_id if current else None,
         }
+
     finally:
         db.close()
 
