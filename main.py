@@ -72,6 +72,21 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc_aware(value: Optional[datetime]) -> Optional[datetime]:
+    """
+    Normaliza fechas para evitar el error:
+    TypeError: can't compare offset-naive and offset-aware datetimes.
+
+    Algunas bases de datos/devuelven DateTime sin tzinfo aunque Google Play
+    venga con +00:00. Para comparar siempre usamos UTC aware.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def parse_google_rfc3339(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -317,7 +332,7 @@ def upsert_entitlement(
     """
     plan = map_plan_from_product_id(product_id)
     status, is_active = map_status_from_google_payload(payload)
-    expiry_date = extract_expiry_date(payload)
+    expiry_date = as_utc_aware(extract_expiry_date(payload))
     latest_order_id = extract_order_id(payload)
 
     if expiry_date and expiry_date < now_utc():
@@ -380,7 +395,8 @@ def get_current_entitlement(db, firebase_uid: str) -> Optional[SubscriptionEntit
         .first()
     )
 
-    if row and row.expiry_date and row.expiry_date < now_utc():
+    row_expiry = as_utc_aware(row.expiry_date) if row and row.expiry_date else None
+    if row and row_expiry and row_expiry < now_utc():
         row.is_active = False
         row.status = "expired"
         row.updated_at = now_utc()
