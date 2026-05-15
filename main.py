@@ -957,6 +957,237 @@ def restore_subscription(req: RestoreSubscriptionRequest, authorization: Optiona
         db.close()
 
 
+# ============================================================
+# MEMORIA / RESUMEN SEMANAL / NOTIFICACIONES INTELIGENTES
+# ============================================================
+
+_EMOTION_RULES = [
+    ("ansiedad", ["ansied", "ansios", "nerv", "pánico", "panico", "miedo", "preocup", "ataque"]),
+    ("tristeza", ["triste", "vacío", "vacio", "llorar", "lloré", "llore", "solo", "sola", "desanim"]),
+    ("agotamiento", ["agot", "cans", "satur", "estrés", "estres", "burnout", "colaps", "no puedo"]),
+    ("sueño", ["dormir", "sueño", "sueno", "insom", "desvel", "noche"]),
+    ("relaciones", ["pareja", "relación", "relacion", "amor", "familia", "hijo", "hija", "ruptura"]),
+    ("autoexigencia", ["culpa", "fracaso", "exigir", "perfect", "debería", "deberia"]),
+]
+
+_EMOJI_BY_TOPIC = {
+    "ansiedad": "😰",
+    "tristeza": "😔",
+    "agotamiento": "😵‍💫",
+    "sueño": "🌙",
+    "relaciones": "💚",
+    "autoexigencia": "🧭",
+    "calma": "🌿",
+}
+
+
+def _safe_lower(text: Optional[str]) -> str:
+    return (text or "").lower()
+
+
+def _detect_topic_from_text(text: str) -> str:
+    lower = _safe_lower(text)
+    scores: dict[str, int] = {}
+    for topic, keys in _EMOTION_RULES:
+        scores[topic] = sum(1 for k in keys if k in lower)
+    best = max(scores.items(), key=lambda x: x[1])
+    return best[0] if best[1] > 0 else "calma"
+
+
+def _emotion_value_from_text(text: str) -> int:
+    topic = _detect_topic_from_text(text)
+    if topic in ["ansiedad", "agotamiento", "tristeza"]:
+        return 2
+    if topic in ["sueño", "autoexigencia", "relaciones"]:
+        return 3
+    return 4
+
+
+def _compact_snippet(text: str, limit: int = 90) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "…"
+
+
+def _topic_label(topic: str) -> str:
+    return {
+        "ansiedad": "ansiedad o nervios",
+        "tristeza": "tristeza o soledad",
+        "agotamiento": "agotamiento o saturación",
+        "sueño": "descanso y sueño",
+        "relaciones": "relaciones importantes",
+        "autoexigencia": "autoexigencia",
+        "calma": "tu bienestar emocional",
+    }.get(topic, "tu bienestar emocional")
+
+
+def _weekly_rows(db, firebase_uid: str, days: int = 7):
+    since = now_utc().replace(tzinfo=None)  # compatibilidad con DateTime sin timezone en SQLAlchemy
+    since = since.replace(hour=0, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    since = since - timedelta(days=days - 1)
+
+    chats = (
+        db.query(ChatTurn)
+        .filter(ChatTurn.user_id == firebase_uid, ChatTurn.role == "user", ChatTurn.created_at >= since)
+        .order_by(ChatTurn.created_at.desc())
+        .limit(40)
+        .all()
+    )
+    journals = (
+        db.query(JournalEntry)
+        .filter(JournalEntry.user_id == firebase_uid, JournalEntry.created_at >= since)
+        .order_by(JournalEntry.created_at.desc())
+        .limit(40)
+        .all()
+    )
+    return chats, journals
+
+
+def _build_memory_payload(db, firebase_uid: str) -> dict[str, Any]:
+    chats = (
+        db.query(ChatTurn)
+        .filter(ChatTurn.user_id == firebase_uid, ChatTurn.role == "user")
+        .order_by(ChatTurn.created_at.desc())
+        .limit(12)
+        .all()
+    )
+    journals = (
+        db.query(JournalEntry)
+        .filter(JournalEntry.user_id == firebase_uid)
+        .order_by(JournalEntry.created_at.desc())
+        .limit(8)
+        .all()
+    )
+    memories = (
+        db.query(MemoryItem)
+        .filter(MemoryItem.user_id == firebase_uid)
+        .order_by(MemoryItem.created_at.desc())
+        .limit(5)
+        .all()
+    )
+
+    texts = [c.content for c in chats] + [j.text for j in journals] + [m.content for m in memories]
+    if not texts:
+        return {
+            "ok": True,
+            "has_memory": False,
+            "topic": "calma",
+            "topic_label": "tu bienestar emocional",
+            "emoji": "🌿",
+            "title": "PsicologIA",
+            "body": "¿Quieres hacer un check-in breve y ver cómo estás hoy?",
+            "payload": "daily_checkin",
+        }
+
+    topic_counts: dict[str, int] = {}
+    for t in texts:
+        topic = _detect_topic_from_text(t)
+        topic_counts[topic] = topic_counts.get(topic, 0) + 1
+    topic = max(topic_counts.items(), key=lambda x: x[1])[0]
+    latest = texts[0]
+    label = _topic_label(topic)
+
+    if topic == "calma":
+        body = "Tu rutina emocional sigue disponible. ¿Quieres revisar cómo estás hoy?"
+    else:
+        body = f"Recuerdo que últimamente apareció {label}. ¿Quieres revisar cómo sigues hoy?"
+
+    return {
+        "ok": True,
+        "has_memory": True,
+        "topic": topic,
+        "topic_label": label,
+        "emoji": _EMOJI_BY_TOPIC.get(topic, "🌿"),
+        "title": "PsicologIA",
+        "body": body,
+        "latest_snippet": _compact_snippet(latest),
+        "payload": "memory_followup",
+    }
+
+
+def _build_weekly_summary_payload(db, firebase_uid: str) -> dict[str, Any]:
+    chats, journals = _weekly_rows(db, firebase_uid, days=7)
+    texts = [c.content for c in chats] + [j.text for j in journals]
+    days_with_activity = set()
+    for row in list(chats) + list(journals):
+        if row.created_at:
+            days_with_activity.add(row.created_at.date().isoformat())
+
+    if not texts:
+        return {
+            "ok": True,
+            "has_data": False,
+            "title": "Tu resumen semanal se está preparando",
+            "body": "Cuando registres emociones o escribas en el diario, aquí aparecerán tus patrones con calma.",
+            "main_topic": "calma",
+            "main_topic_label": "tu bienestar emocional",
+            "emoji": "🌿",
+            "activity_days": 0,
+            "journal_entries": 0,
+            "chat_messages": 0,
+            "suggestion": "Empieza con un check-in de 1 minuto.",
+        }
+
+    topic_counts: dict[str, int] = {}
+    values: list[int] = []
+    for t in texts:
+        topic = _detect_topic_from_text(t)
+        topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        values.append(_emotion_value_from_text(t))
+    main_topic = max(topic_counts.items(), key=lambda x: x[1])[0]
+    avg = sum(values) / max(len(values), 1)
+    label = _topic_label(main_topic)
+
+    if avg <= 2.2:
+        tone = "Esta semana pidió más cuidado y menos exigencia."
+        suggestion = "Haz una pausa breve, escribe dos líneas y retoma una conversación suave."
+    elif avg <= 3.2:
+        tone = "Hubo señales mixtas: algo pesó, pero también hubo continuidad."
+        suggestion = "Elige una acción pequeña diaria: respirar, escribir o hablar 2 minutos."
+    else:
+        tone = "Tu semana se ve más estable y con mejor continuidad emocional."
+        suggestion = "Mantén el hábito; lo importante es volver sin exigirte perfección."
+
+    return {
+        "ok": True,
+        "has_data": True,
+        "title": "Tu semana emocional en calma",
+        "body": f"{tone} El patrón más visible fue {label}.",
+        "main_topic": main_topic,
+        "main_topic_label": label,
+        "emoji": _EMOJI_BY_TOPIC.get(main_topic, "🌿"),
+        "activity_days": len(days_with_activity),
+        "journal_entries": len(journals),
+        "chat_messages": len(chats),
+        "suggestion": suggestion,
+        "notification_body": f"Tu resumen semanal está listo. Esta semana destacó {label}. ¿Quieres verlo con calma?",
+    }
+
+
+@app.get("/memory/notification-context")
+def memory_notification_context(authorization: Optional[str] = Header(default=None)):
+    decoded = verify_firebase_token(authorization)
+    firebase_uid = decoded["uid"]
+    db = SessionLocal()
+    try:
+        return _build_memory_payload(db, firebase_uid)
+    finally:
+        db.close()
+
+
+@app.get("/memory/weekly-summary")
+def memory_weekly_summary(authorization: Optional[str] = Header(default=None)):
+    decoded = verify_firebase_token(authorization)
+    firebase_uid = decoded["uid"]
+    db = SessionLocal()
+    try:
+        return _build_weekly_summary_payload(db, firebase_uid)
+    finally:
+        db.close()
+
+
 @app.post("/chat")
 def chat(req: ChatRequest):
     db = SessionLocal()
