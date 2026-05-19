@@ -187,6 +187,7 @@ class ChatRequest(BaseModel):
     companion_style: str | None = "suave"   # suave | directa | motivadora | reflexiva
     remembered_topic: str | None = ""
     user_id: str | None = None
+    emotional_context: str | None = ""
 
 
 class DiarioRequest(BaseModel):
