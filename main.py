@@ -203,6 +203,7 @@ class VerifySubscriptionRequest(BaseModel):
     purchase_token: str
     product_id: str
     package_name: Optional[str] = None
+    platform: Optional[str] = "android"
 
 
 class RestoreSubscriptionRequest(BaseModel):
@@ -623,6 +624,38 @@ REGLAS DE RESPUESTA — sigue TODAS:
 8. No des diagnósticos. No uses lenguaje técnico sin explicarlo.
 9. Mantén el hilo de la conversación reciente. No empieces desde cero.
 10. Si el usuario habló de algo (pareja, trabajo, insomnio), continúa ESE hilo.
+11. Habla como una persona cercana y emocionalmente inteligente, NO como terapeuta clínico.
+12. La conversación debe sentirse natural, cálida y humana.
+13. A veces valida primero SIN hacer preguntas inmediatas.
+14. Usa pequeñas expresiones humanas naturales como:
+   "Uf..."
+   "Eso pesa mucho."
+   "Te entiendo."
+   "Tiene sentido que te sientas así."
+   "No debió ser fácil."
+   "Qué agotador."
+   pero sin exagerar ni sonar artificial.
+15. No uses tono corporativo ni frases robóticas de bienestar.
+16. Prioriza conexión emocional antes que consejos.
+17. Evita responder como chatbot asistente virtual.
+18. No enumeres soluciones como lista salvo que la persona las pida.
+19. Si el usuario vuelve varias veces sobre un tema, muestra continuidad emocional:
+   "Siento que esto lleva tiempo pesándote."
+   "Parece que esto te viene agotando desde hace días."
+20. Las respuestas deben sentirse como conversación de confianza entre dos personas.
+21. A veces una respuesta corta y cálida es mejor que una explicación larga.
+22. No fuerces optimismo.
+23. Si el usuario está vulnerable, habla con más suavidad y menos preguntas.
+24. Nunca hagas sentir al usuario analizado psicológicamente.
+25. La app acompaña, escucha y ayuda a ordenar emociones; no diagnostica.
+26. Usa lenguaje moderno, natural y cercano, especialmente para usuarios jóvenes adultos.
+27. Evita repetir constantemente:
+   "¿Cómo te sientes?"
+   "Estoy aquí para ti."
+   "Entiendo cómo te sientes."
+28. Mantén variedad emocional y naturalidad en cada respuesta.
+29. Si el usuario comparte algo doloroso, primero acompaña emocionalmente antes de analizar.
+30. Haz que el usuario sienta calma, compañía y seguridad emocional.
 
 SEGURIDAD:
 Si detectas riesgo grave, autolesión o suicidio:
@@ -632,22 +665,58 @@ Si detectas riesgo grave, autolesión o suicidio:
 - En España: Teléfono de la Esperanza 717 003 717. En Colombia: Línea 106.
 
 EJEMPLOS DE BUEN TONO (úsalos como referencia de estilo, no como plantilla):
+Usuario: "No sé qué me pasa últimamente."
+Asistente: "A veces uno llega a un punto donde ya no sabe si está cansado, triste o simplemente saturado de todo. ¿Sientes que te viene pasando seguido?"
+
+Usuario: "Me siento solo."
+Asistente: "La soledad pesa más cuando llevas días guardándote todo. ¿Has podido hablar con alguien de cómo te sientes realmente?"
+
+Usuario: "Estoy agotado."
+Asistente: "Uf… cuando el cansancio ya es mental y emocional, hasta responder mensajes cuesta."
+
+Usuario: "No quiero hacer nada."
+Asistente: "Suena a que llevas demasiado tiempo sosteniendo cosas por dentro."
+
+Usuario: "Tuve ansiedad otra vez."
+Asistente: "¿Fue de esas veces donde sientes que tu cabeza va demasiado rápido y tu cuerpo no logra seguirle el ritmo?"
 - Usuario: "Me siento fatal sin saber por qué." → "Uf, eso agota el doble: sentirse mal encima de no poder explicárselo. No tenemos que resolverlo ahora. ¿Se siente más como tristeza, ansiedad o simplemente vacío?"
 - Usuario: "Mi pareja no respondió y me activé mucho." → "Entiendo por qué eso te activó. Muchas veces lo que duele no es el silencio, sino la historia que la mente empieza a construir. ¿Qué fue lo primero que pensaste?"
 - Usuario: "No puedo dormir." → "Qué frustrante es cuando el cuerpo está cansado y la mente no baja el volumen. ¿Quieres que te guíe con una respiración breve o prefieres vaciar primero lo que tienes en la cabeza?"
 """.strip()
 
 
-def openai_chat_reply(req: ChatRequest, memory_lines: list[str], journal_lines: list[str], recent_chat_lines: list[str]) -> str:
+def openai_chat_reply(
+    req: ChatRequest,
+    memory_lines: list[str],
+    journal_lines: list[str],
+    recent_chat_lines: list[str],
+    emotional_context: str = "",
+) -> str:
     if client is None:
         return fallback_chat_reply(req)
 
     system_prompt = build_system_prompt(req, memory_lines, journal_lines)
     transcript = "\n".join(recent_chat_lines[-8:]) if recent_chat_lines else "Sin conversación reciente."
+    
+    emotional_context_block = ""
+    if emotional_context:
+        emotional_context_block = f"""
+
+    Contexto emocional reciente:
+    {emotional_context}
+
+    Usa este contexto de forma sutil, humana y no invasiva.
+    No digas "según tus datos" ni "tu historial dice".
+    Si ayuda, mantén continuidad emocional con frases como:
+    "recuerdo que últimamente...", "podemos retomarlo con calma..." o
+    "parece que este tema ha estado presente".
+    """
 
     user_prompt = f"""
 Conversación reciente:
 {transcript}
+
+{emotional_context_block}
 
 Mensaje actual del usuario:
 {req.mensaje}
@@ -787,6 +856,7 @@ def verify_subscription(req: VerifySubscriptionRequest, authorization: Optional[
     firebase_uid = decoded["uid"]
     email = decoded.get("email")
     package_name = (req.package_name or ANDROID_PACKAGE_NAME).strip()
+    platform = getattr(req, "platform", "android")
 
     if not req.purchase_token.strip():
         raise HTTPException(status_code=400, detail="purchase_token obligatorio")
@@ -795,14 +865,53 @@ def verify_subscription(req: VerifySubscriptionRequest, authorization: Optional[
 
     db = SessionLocal()
     try:
-        payload = google_verify_subscription(package_name=package_name, purchase_token=req.purchase_token.strip())
+        if platform == "ios":
+
+            product_id = req.product_id.strip().lower()
+
+            if "premium" in product_id:
+                plan = "premium"
+            elif "plus" in product_id:
+                plan = "plus"
+            else:
+                plan = "free"
+
+            row = upsert_entitlement(
+                db=db,
+                firebase_uid=firebase_uid,
+                email=email,
+                user_id=f"firebase::{firebase_uid}",
+                purchase_token=req.purchase_token.strip(),
+                product_id=req.product_id.strip(),
+                payload={
+                    "platform": "ios",
+                    "plan": plan,
+                    "status": "active"
+                }
+            )
+
+            db.commit()
+
+            return {
+                "ok": True,
+                "platform": "ios",
+                "plan": plan,
+                "status": "active"
+            }
+
+        # ANDROID
+        payload = google_verify_subscription(
+            package_name=package_name,
+            purchase_token=req.purchase_token.strip()
+        )
+
         row = upsert_entitlement(
-            db=db,
-            firebase_uid=firebase_uid,
-            email=email,
-            user_id=f"firebase::{firebase_uid}",
-            purchase_token=req.purchase_token.strip(),
-            product_id=req.product_id.strip(),
+                db=db,
+                firebase_uid=firebase_uid,
+                email=email,
+                user_id=f"firebase::{firebase_uid}",
+                purchase_token=req.purchase_token.strip(),
+                product_id=req.product_id.strip(),
             payload=payload,
         )
 
@@ -1207,7 +1316,15 @@ def chat(req: ChatRequest):
         recent_chat_lines = [f"{row.role}: {row.content}" for row in recent_chat]
 
         save_chat_turn(db, user_id, "user", req.mensaje)
-        respuesta = openai_chat_reply(req, memory_lines, journal_lines, recent_chat_lines)
+        emotional_context = (req.emotional_context or "").strip()
+
+        respuesta = openai_chat_reply(
+            req,
+             memory_lines,
+             journal_lines,
+             recent_chat_lines,
+             emotional_context
+        )
         save_chat_turn(db, user_id, "assistant", respuesta)
 
         inferred_memory = heuristic_memory_update(req.mensaje)
