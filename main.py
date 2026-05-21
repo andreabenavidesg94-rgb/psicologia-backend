@@ -1,6 +1,8 @@
+import hashlib
 import json
 import logging
 import os
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -875,13 +877,17 @@ def verify_subscription(req: VerifySubscriptionRequest, authorization: Optional[
                 plan = "plus"
             else:
                 plan = "free"
+                
+            apple_token_hash = "ios_" + hashlib.sha256(
+                 req.purchase_token.strip().encode("utf-8")
+            ).hexdigest()
 
             row = upsert_entitlement(
                 db=db,
                 firebase_uid=firebase_uid,
                 email=email,
                 user_id=f"firebase::{firebase_uid}",
-                purchase_token=req.purchase_token.strip(),
+                purchase_token=apple_token_hash,
                 product_id=req.product_id.strip(),
                 payload={
                     "platform": "ios",
@@ -889,6 +895,12 @@ def verify_subscription(req: VerifySubscriptionRequest, authorization: Optional[
                     "status": "active"
                 }
             )
+            
+            row.plan = plan
+            row.source = "ios"
+            row.status = "active"
+            row.is_active = True
+            row.product_id = req.product_id.strip()
 
             db.commit()
 
